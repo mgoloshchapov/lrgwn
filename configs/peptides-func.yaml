@@ -1,0 +1,18 @@
+# config.yaml
+dataset:
+  name: "Peptides-func"
+  root: "./data"
+  k_eig: 20
+
+model:
+  hidden_channels: 128
+  num_layers: 4
+  K_cheb: 3
+  heads: 4
+  gamma: 1.0
+
+train:
+  lr: 0.001
+  epochs: 100
+  batch_size: 32
+  device: "cuda"
