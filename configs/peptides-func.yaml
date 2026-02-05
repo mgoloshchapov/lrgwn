@@ -9,10 +9,25 @@ model:
   num_layers: 4
   K_cheb: 3
   heads: 4
+  num_scales: 1
+  num_gaussians: 16
+  shared_filters: false
+  admissible: false
+  aggregation: "concat"
+  dropout: 0.0
   gamma: 1.0
 
 train:
   lr: 0.001
   epochs: 100
   batch_size: 32
-  device: "cuda"
+  device: "auto"
+  test_interval: 10
+
+logging:
+  use_wandb: true
+  project: "lrgwn"
+  entity: null
+  name: null
+  tags: []
+  log_every: 1
