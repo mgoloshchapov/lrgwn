@@ -1,13 +1,35 @@
-# Python-generated files
+# Python artifacts
 __pycache__/
-*.py[oc]
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
 build/
 dist/
-wheels/
-*.egg-info
 
-# Virtual environments
-.venv
+# Virtual environments / tooling
+.venv/
+.uv-cache/
+lrgwn.egg-info/
 
-# Mac files
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# Project data / outputs
+data/
+outputs/
+wandb/
