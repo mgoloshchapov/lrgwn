@@ -8,9 +8,9 @@ model:
   hidden_channels: 128
   num_layers: 4
   K_cheb: 3
-  heads: 4
-  num_scales: 1
+  num_scales: 16
   num_gaussians: 16
+  lambda_cut: 2.0
   shared_filters: false
   admissible: false
   aggregation: "concat"
@@ -23,6 +23,9 @@ train:
   batch_size: 32
   device: "auto"
   test_interval: 10
+  num_workers: 0
+  pin_memory: false
+  deterministic: false
 
 logging:
   use_wandb: true

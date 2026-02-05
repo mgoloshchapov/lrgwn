@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch_geometric.nn import global_mean_pool
-from lrgwn.layer import CachedSpectralGPSLayer
+from lrgwn.layer import LRGWNLayer
 
 
 class SpectralGPSModel(nn.Module):
@@ -12,28 +12,26 @@ class SpectralGPSModel(nn.Module):
         out_channels,
         num_layers,
         K_cheb,
-        k_eig,
-        heads,
-        num_scales: int = 1,
-        num_gaussians: int = 16,
-        shared_filters: bool = False,
-        admissible: bool = False,
-        aggregation: str = "concat",
-        dropout: float = 0.0,
+        num_scales: int,
+        num_gaussians: int,
+        lambda_cut: float,
+        shared_filters: bool,
+        admissible: bool,
+        aggregation: str,
+        dropout: float,
     ):
         super().__init__()
         self.node_emb = nn.Linear(in_channels, hidden_channels)
 
         self.layers = nn.ModuleList(
             [
-                CachedSpectralGPSLayer(
-                    hidden_channels,
-                    K_cheb,
-                    k_eig,
-                    heads=heads,
+                LRGWNLayer(
+                    channels=hidden_channels,
+                    K_cheb=K_cheb,
                     dropout=dropout,
                     num_scales=num_scales,
                     num_gaussians=num_gaussians,
+                    lambda_cut=lambda_cut,
                     shared_filters=shared_filters,
                     admissible=admissible,
                     aggregation=aggregation,
@@ -44,7 +42,7 @@ class SpectralGPSModel(nn.Module):
 
         self.mlp_head = nn.Sequential(
             nn.Linear(hidden_channels, hidden_channels),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(hidden_channels, out_channels),
         )
 

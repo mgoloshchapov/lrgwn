@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import ChebConv
+from torch_geometric.nn.models.schnet import GaussianSmearing
 from torch_geometric.utils import to_dense_batch
 
 
@@ -11,8 +12,8 @@ class WaveletFilter(nn.Module):
         channels: int,
         K_cheb: int,
         num_gaussians: int,
-        lambda_cut: float = 2.0,
-        admissible: bool = False,
+        lambda_cut: float,
+        admissible: bool,
     ) -> None:
         super().__init__()
         self.channels = channels
@@ -20,25 +21,25 @@ class WaveletFilter(nn.Module):
         self.admissible = admissible
 
         self.cheb = ChebConv(channels, channels, K=K_cheb, normalization="sym")
-        offsets = torch.linspace(0.0, lambda_cut, num_gaussians)
-        delta = lambda_cut / max(num_gaussians - 1, 1)
-        coeff = -0.5 / (delta * delta)
-        self.register_buffer("gaussian_offset", offsets)
-        self.register_buffer("gaussian_coeff", torch.tensor(coeff))
+        self.gaussian_smearing = GaussianSmearing(
+            start=0.0,
+            stop=lambda_cut,
+            num_gaussians=num_gaussians,
+        )
         self.spectral_weights = nn.Linear(num_gaussians, channels, bias=False)
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         self.cheb.reset_parameters()
-        for idx, lin in enumerate(self.cheb.lins):
-            if lin.weight.shape[0] == lin.weight.shape[1]:
-                if idx == 0:
+        with torch.no_grad():
+            for idx, lin in enumerate(self.cheb.lins):
+                if idx == 0 and lin.weight.shape[0] == lin.weight.shape[1]:
                     nn.init.eye_(lin.weight)
+                elif idx == 0:
+                    nn.init.xavier_uniform_(lin.weight)
                 else:
                     nn.init.zeros_(lin.weight)
-            else:
-                nn.init.zeros_(lin.weight)
         if self.cheb.bias is not None:
             nn.init.zeros_(self.cheb.bias)
         nn.init.ones_(self.spectral_weights.weight)
@@ -54,6 +55,7 @@ class WaveletFilter(nn.Module):
         if U.numel() == 0:
             return torch.zeros_like(x)
 
+        # Sanity checks
         if Lambda.dim() == 1:
             num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
             if Lambda.numel() % num_graphs == 0:
@@ -82,8 +84,9 @@ class WaveletFilter(nn.Module):
         return out_dense[mask]
 
     def _gaussian_smearing(self, values: torch.Tensor) -> torch.Tensor:
-        diff = values.unsqueeze(-1) - self.gaussian_offset
-        return torch.exp(self.gaussian_coeff * diff * diff)
+        original_shape = values.shape
+        smeared = self.gaussian_smearing(values.reshape(-1))
+        return smeared.view(*original_shape, -1)
 
     def forward(
         self,
@@ -117,13 +120,13 @@ class LRGWNLayer(nn.Module):
         self,
         channels: int,
         K_cheb: int,
-        k_eig: int,
-        num_scales: int = 1,
-        num_gaussians: int = 16,
-        shared_filters: bool = False,
-        admissible: bool = False,
-        aggregation: str = "concat",
-        dropout: float = 0.0,
+        num_scales: int,
+        num_gaussians: int,
+        lambda_cut: float,
+        shared_filters: bool,
+        admissible: bool,
+        aggregation: str,
+        dropout: float,
     ) -> None:
         super().__init__()
         self.channels = channels
@@ -133,13 +136,14 @@ class LRGWNLayer(nn.Module):
 
         self.feature_proj = nn.Linear(channels, channels)
         self.dropout = nn.Dropout(dropout)
-        self.activation = nn.ReLU()
+        self.activation = nn.GELU()
 
         if shared_filters:
             self.shared_filter = WaveletFilter(
                 channels,
                 K_cheb,
                 num_gaussians,
+                lambda_cut=lambda_cut,
                 admissible=admissible,
             )
             self.log_s_min = nn.Parameter(torch.tensor(0.0))
@@ -149,6 +153,7 @@ class LRGWNLayer(nn.Module):
                 channels,
                 K_cheb,
                 num_gaussians,
+                lambda_cut=lambda_cut,
                 admissible=admissible,
             )
             self.wavelet_filters = nn.ModuleList(
@@ -157,6 +162,7 @@ class LRGWNLayer(nn.Module):
                         channels,
                         K_cheb,
                         num_gaussians,
+                        lambda_cut=lambda_cut,
                         admissible=admissible,
                     )
                     for _ in range(self.num_scales)
@@ -219,30 +225,3 @@ class LRGWNLayer(nn.Module):
             merged = self.merge(torch.cat(outputs, dim=-1))
 
         return self.dropout(merged)
-
-
-class CachedSpectralGPSLayer(LRGWNLayer):
-    def __init__(
-        self,
-        channels,
-        K_cheb,
-        k_eig,
-        heads=4,
-        dropout=0.1,
-        num_scales: int = 1,
-        num_gaussians: int = 16,
-        shared_filters: bool = False,
-        admissible: bool = False,
-        aggregation: str = "concat",
-    ):
-        super().__init__(
-            channels=channels,
-            K_cheb=K_cheb,
-            k_eig=k_eig,
-            num_scales=num_scales,
-            num_gaussians=num_gaussians,
-            shared_filters=shared_filters,
-            admissible=admissible,
-            aggregation=aggregation,
-            dropout=dropout,
-        )
