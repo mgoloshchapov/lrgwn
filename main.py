@@ -3,32 +3,22 @@ from __future__ import annotations
 import importlib
 
 import hydra
-import numpy as np
 import torch
 import wandb
 from omegaconf import DictConfig, OmegaConf
-from sklearn.metrics import average_precision_score
 from torch.utils.data import random_split
 from torch_geometric.loader import DataLoader
-from torch_geometric.transforms import (
-    AddRandomWalkPE,
-    Compose,
-    LaplacianLambdaMax,
-)
 
 from lrgwn.config import ExperimentConfig
 from lrgwn.model import SpectralGPSModel
-from lrgwn.transforms import SafeAddLaplacianEigenvectorPE
-from lrgwn.utils import CachedSpectralTransform
+from lrgwn.utils import build_dataset_transforms
 
 
 def _resolve_device(device_cfg: str) -> torch.device:
     if device_cfg == "auto":
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        if torch.cuda.is_available():
-            return torch.device("cuda")
         return torch.device("cpu")
+    if device_cfg == "mps":
+        raise ValueError("MPS support is disabled for this project. Use train.device=cpu.")
     return torch.device(device_cfg)
 
 
@@ -36,79 +26,6 @@ def _load_class(target: str):
     module_name, class_name = target.rsplit(".", maxsplit=1)
     module = importlib.import_module(module_name)
     return getattr(module, class_name)
-
-
-def _compose_or_none(transforms):
-    if not transforms:
-        return None
-    if len(transforms) == 1:
-        return transforms[0]
-    return Compose(transforms)
-
-
-def _build_transforms(cfg: ExperimentConfig):
-    base_transforms = [CachedSpectralTransform(k=cfg.dataset.k_eig)]
-    if cfg.dataset.use_lambda_max:
-        base_transforms.append(LaplacianLambdaMax(normalization="sym"))
-    encoding_transforms = []
-
-    pos_dim = 0
-    pos_cfg = cfg.model.positional_encoding
-    if pos_cfg.enabled:
-        if pos_cfg.kind == "laplacian_eigenvector":
-            encoding_transforms.append(
-                SafeAddLaplacianEigenvectorPE(
-                    k=pos_cfg.dim,
-                    attr_name=pos_cfg.attr_name,
-                    is_undirected=pos_cfg.is_undirected,
-                )
-            )
-        elif pos_cfg.kind == "random_walk":
-            encoding_transforms.append(
-                AddRandomWalkPE(
-                    walk_length=pos_cfg.dim,
-                    attr_name=pos_cfg.attr_name,
-                )
-            )
-        else:
-            raise ValueError(f"Unsupported positional_encoding.kind='{pos_cfg.kind}'.")
-        pos_dim = pos_cfg.dim
-
-    struct_dim = 0
-    struct_cfg = cfg.model.structural_encoding
-    if struct_cfg.enabled:
-        if struct_cfg.kind == "random_walk":
-            encoding_transforms.append(
-                AddRandomWalkPE(
-                    walk_length=struct_cfg.dim,
-                    attr_name=struct_cfg.attr_name,
-                )
-            )
-        elif struct_cfg.kind == "laplacian_eigenvector":
-            encoding_transforms.append(
-                SafeAddLaplacianEigenvectorPE(
-                    k=struct_cfg.dim,
-                    attr_name=struct_cfg.attr_name,
-                    is_undirected=True,
-                )
-            )
-        else:
-            raise ValueError(f"Unsupported structural_encoding.kind='{struct_cfg.kind}'.")
-        struct_dim = struct_cfg.dim
-
-    if pos_cfg.enabled and struct_cfg.enabled and pos_cfg.attr_name == struct_cfg.attr_name:
-        raise ValueError(
-            "positional_encoding.attr_name and structural_encoding.attr_name must differ."
-        )
-
-    if cfg.dataset.precompute_transforms:
-        pre_transform = _compose_or_none(base_transforms)
-        transform = _compose_or_none(encoding_transforms)
-    else:
-        pre_transform = None
-        transform = _compose_or_none(base_transforms + encoding_transforms)
-
-    return pre_transform, transform, pos_dim, struct_dim
 
 
 def _split_lengths(total_len: int, ratios: list[float]) -> list[int]:
@@ -127,32 +44,95 @@ def _split_lengths(total_len: int, ratios: list[float]) -> list[int]:
 def _build_datasets(cfg: ExperimentConfig, pre_transform, transform):
     dataset_cls = _load_class(cfg.dataset.target)
     init_args = dict(cfg.dataset.init_args)
-    dataset_kwargs = {}
-    if pre_transform is not None:
-        dataset_kwargs["pre_transform"] = pre_transform
-    if transform is not None:
-        dataset_kwargs["transform"] = transform
-    if cfg.dataset.force_reload:
-        dataset_kwargs["force_reload"] = True
+    force_reload = bool(cfg.dataset.force_reload)
 
     if cfg.dataset.split_arg:
         datasets = {}
-        for split_name in ("train", "val", "test"):
+        for split_idx, split_name in enumerate(("train", "val", "test")):
             if split_name not in cfg.dataset.splits:
                 raise ValueError(f"dataset.splits missing '{split_name}'.")
             kwargs = dict(init_args)
             kwargs[cfg.dataset.split_arg] = cfg.dataset.splits[split_name]
-            kwargs.update(dataset_kwargs)
+            if pre_transform is not None:
+                kwargs["pre_transform"] = pre_transform
+            if transform is not None:
+                kwargs["transform"] = transform
+            # Reload once to refresh processed artifacts, then reuse for other splits.
+            if force_reload and split_idx == 0:
+                kwargs["force_reload"] = True
             datasets[split_name] = dataset_cls(**kwargs)
         return datasets["train"], datasets["val"], datasets["test"]
 
     kwargs = dict(init_args)
-    kwargs.update(dataset_kwargs)
+    if pre_transform is not None:
+        kwargs["pre_transform"] = pre_transform
+    if transform is not None:
+        kwargs["transform"] = transform
+    if force_reload:
+        kwargs["force_reload"] = True
     full_dataset = dataset_cls(**kwargs)
     lengths = _split_lengths(len(full_dataset), cfg.dataset.random_split)
     generator = torch.Generator().manual_seed(cfg.dataset.split_seed)
     train_ds, val_ds, test_ds = random_split(full_dataset, lengths, generator=generator)
     return train_ds, val_ds, test_ds
+
+
+def _required_encoding_attrs(cfg: ExperimentConfig) -> list[str]:
+    attrs: list[str] = []
+    if cfg.model.positional_encoding.enabled and cfg.model.positional_encoding.dim > 0:
+        attrs.append(cfg.model.positional_encoding.attr_name)
+    if cfg.model.structural_encoding.enabled and cfg.model.structural_encoding.dim > 0:
+        attrs.append(cfg.model.structural_encoding.attr_name)
+    return attrs
+
+
+def _missing_encoding_attrs(dataset, required_attrs: list[str]) -> list[str]:
+    if not required_attrs or len(dataset) == 0:
+        return []
+    sample = dataset[0]
+    return [attr for attr in required_attrs if not hasattr(sample, attr)]
+
+
+def _ensure_precomputed_encodings(
+    cfg: ExperimentConfig,
+    pre_transform,
+    transform,
+    train_dataset,
+    val_dataset,
+    test_dataset,
+):
+    required_attrs = _required_encoding_attrs(cfg)
+    if not required_attrs or not cfg.dataset.precompute_transforms or pre_transform is None:
+        return train_dataset, val_dataset, test_dataset
+
+    missing = {
+        "train": _missing_encoding_attrs(train_dataset, required_attrs),
+        "val": _missing_encoding_attrs(val_dataset, required_attrs),
+        "test": _missing_encoding_attrs(test_dataset, required_attrs),
+    }
+    has_missing = any(missing_attrs for missing_attrs in missing.values())
+    if not has_missing:
+        return train_dataset, val_dataset, test_dataset
+
+    if cfg.dataset.force_reload:
+        missing_summary = ", ".join(
+            f"{split}={attrs}" for split, attrs in missing.items() if attrs
+        )
+        raise ValueError(
+            "Required precomputed encoding attributes are missing even with "
+            f"dataset.force_reload=true: {missing_summary}."
+        )
+
+    print(
+        "Detected stale processed dataset cache without required encoding attributes "
+        f"{required_attrs}. Rebuilding dataset once with force_reload=True."
+    )
+    old_force_reload = cfg.dataset.force_reload
+    cfg.dataset.force_reload = True
+    try:
+        return _build_datasets(cfg, pre_transform, transform)
+    finally:
+        cfg.dataset.force_reload = old_force_reload
 
 
 def _infer_in_channels(dataset, sample) -> int:
@@ -233,12 +213,14 @@ def _compute_metric(metric_name: str, logits_list, targets_list) -> float:
     targets = torch.cat(targets_list, dim=0)
 
     if metric_name == "average_precision":
-        logits_np = logits.numpy()
-        targets_np = targets.numpy()
         try:
+            from sklearn.metrics import average_precision_score
+
+            logits_np = logits.numpy()
+            targets_np = targets.numpy()
             return float(average_precision_score(targets_np, logits_np, average="macro"))
-        except ValueError:
-            return 0.0
+        except Exception:
+            return _multilabel_average_precision_macro(logits, targets)
 
     if metric_name == "accuracy":
         preds = logits.argmax(dim=-1)
@@ -248,6 +230,35 @@ def _compute_metric(metric_name: str, logits_list, targets_list) -> float:
         return float(torch.mean(torch.abs(logits - targets)).item())
 
     raise ValueError(f"Unsupported task.metric='{metric_name}'.")
+
+
+def _multilabel_average_precision_macro(logits: torch.Tensor, targets: torch.Tensor) -> float:
+    if logits.dim() == 1:
+        logits = logits.unsqueeze(-1)
+    if targets.dim() == 1:
+        targets = targets.unsqueeze(-1)
+
+    scores = []
+    targets = (targets > 0.5).to(dtype=torch.float32)
+    for class_idx in range(logits.size(-1)):
+        y_true = targets[:, class_idx]
+        y_score = logits[:, class_idx]
+        positive_count = int(y_true.sum().item())
+        if positive_count == 0:
+            scores.append(0.0)
+            continue
+
+        order = torch.argsort(y_score, descending=True)
+        y_sorted = y_true[order]
+        tp_cum = torch.cumsum(y_sorted, dim=0)
+        ranks = torch.arange(1, y_sorted.numel() + 1, device=y_sorted.device)
+        precision = tp_cum / ranks
+        ap = float((precision * y_sorted).sum().item() / positive_count)
+        scores.append(ap)
+
+    if not scores:
+        return 0.0
+    return float(sum(scores) / len(scores))
 
 
 def _eval_epoch(model, loader, criterion, device, task_type: str, metric_name: str):
@@ -285,9 +296,19 @@ def main(cfg: DictConfig):
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
 
-    pre_transform, transform, positional_dim, structural_dim = _build_transforms(cfg_obj)
+    pre_transform, transform, positional_dim, structural_dim = build_dataset_transforms(
+        cfg_obj
+    )
     train_dataset, val_dataset, test_dataset = _build_datasets(
         cfg_obj, pre_transform, transform
+    )
+    train_dataset, val_dataset, test_dataset = _ensure_precomputed_encodings(
+        cfg_obj,
+        pre_transform,
+        transform,
+        train_dataset,
+        val_dataset,
+        test_dataset,
     )
 
     train_loader = DataLoader(
