@@ -19,8 +19,3 @@ structural_encoding:
   kind: "random_walk"
   dim: 16
   attr_name: "se"
-gps:
-  enabled: true
-  heads: 4
-  dropout: 0.1
-  attn_type: "multihead"
