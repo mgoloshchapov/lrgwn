@@ -1,0 +1,2 @@
+type: "multilabel_classification"
+metric: "average_precision"

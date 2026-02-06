@@ -1,0 +1,13 @@
+target: "torch_geometric.datasets.LRGBDataset"
+init_args:
+  root: "./data"
+  name: "Peptides-func"
+split_arg: "split"
+splits:
+  train: "train"
+  val: "val"
+  test: "test"
+k_eig: 20
+precompute_transforms: true
+use_lambda_max: true
+force_reload: false

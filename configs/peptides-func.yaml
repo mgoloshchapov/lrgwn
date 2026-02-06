@@ -1,36 +1,7 @@
-# config.yaml
-dataset:
-  name: "Peptides-func"
-  root: "./data"
-  k_eig: 20
-
-model:
-  hidden_channels: 128
-  num_layers: 4
-  K_cheb: 3
-  num_scales: 16
-  num_gaussians: 16
-  lambda_cut: 2.0
-  shared_filters: false
-  admissible: false
-  aggregation: "concat"
-  dropout: 0.0
-  gamma: 1.0
-
-train:
-  lr: 0.001
-  epochs: 100
-  batch_size: 32
-  device: "auto"
-  test_interval: 10
-  num_workers: 0
-  pin_memory: false
-  deterministic: false
-
-logging:
-  use_wandb: true
-  project: "lrgwn"
-  entity: null
-  name: null
-  tags: []
-  log_every: 1
+defaults:
+  - dataset: peptides-func
+  - model: lrgwn-gps
+  - train: default
+  - logging: default
+  - task: multilabel
+  - _self_

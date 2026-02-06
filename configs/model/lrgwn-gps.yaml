@@ -1,0 +1,26 @@
+hidden_channels: 128
+num_layers: 4
+K_cheb: 8
+num_scales: 8
+num_gaussians: 8
+lambda_cut: 2.0
+shared_filters: false
+admissible: false
+aggregation: "concat"
+dropout: 0.0
+positional_encoding:
+  enabled: true
+  kind: "laplacian_eigenvector"
+  dim: 16
+  attr_name: "pe"
+  is_undirected: true
+structural_encoding:
+  enabled: true
+  kind: "random_walk"
+  dim: 16
+  attr_name: "se"
+gps:
+  enabled: true
+  heads: 4
+  dropout: 0.1
+  attn_type: "multihead"

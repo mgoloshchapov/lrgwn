@@ -1,0 +1,6 @@
+use_wandb: true
+project: "lrgwn"
+entity: null
+name: null
+tags: []
+log_every: 1
