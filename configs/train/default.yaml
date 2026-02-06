@@ -1,7 +1,7 @@
 lr: 0.001
 epochs: 100
 batch_size: 32
-device: "auto"
+device: "cpu"
 test_interval: 10
 num_workers: 0
 pin_memory: false

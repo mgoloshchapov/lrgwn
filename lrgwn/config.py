@@ -69,7 +69,7 @@ class TrainConfig:
     lr: float = 1e-3
     epochs: int = 100
     batch_size: int = 32
-    device: str = "auto"
+    device: str = "cpu"
     test_interval: int = 10
     num_workers: int = 0
     pin_memory: bool = False
