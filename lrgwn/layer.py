@@ -14,13 +14,16 @@ class WaveletFilter(nn.Module):
         num_gaussians: int,
         lambda_cut: float,
         admissible: bool,
+        window_type: str | None = "tukey",
     ) -> None:
         super().__init__()
         self.channels = channels
         self.K_cheb = K_cheb
         self.admissible = admissible
+        self.lambda_cut = float(lambda_cut)
+        self.window_type = window_type
 
-        self.cheb = ChebConv(channels, channels, K=K_cheb, normalization="sym")
+        self.cheb = ChebConv(channels, channels, K=K_cheb, normalization="sym", bias=False)
         self.gaussian_smearing = GaussianSmearing(
             start=0.0,
             stop=lambda_cut,
@@ -40,9 +43,32 @@ class WaveletFilter(nn.Module):
                     nn.init.xavier_uniform_(lin.weight)
                 else:
                     nn.init.zeros_(lin.weight)
-        if self.cheb.bias is not None:
-            nn.init.zeros_(self.cheb.bias)
-        nn.init.ones_(self.spectral_weights.weight)
+        nn.init.xavier_uniform_(self.spectral_weights.weight)
+
+    def _spatial_zero_response(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros_like(x)
+        for idx, lin in enumerate(self.cheb.lins):
+            sign = -1.0 if (idx % 2 == 1) else 1.0
+            out = out + sign * lin(x)
+        return out
+
+    def _spectral_window(self, values: torch.Tensor) -> torch.Tensor:
+        if self.window_type is None:
+            return torch.ones_like(values)
+
+        window_key = self.window_type.lower()
+        scale = max(self.lambda_cut, 1e-8)
+        x = values / scale
+
+        if window_key == "tukey":
+            alpha = 0.5
+            tail = torch.cos(torch.pi * (x - alpha) / max(2.0 - 2.0 * alpha, 1e-8))
+            return torch.where(x <= alpha, torch.ones_like(values), tail.clamp_min(0.0))
+        if window_key in {"exp", "exponential"}:
+            tau = 1.0 / torch.log(torch.tensor(10.0, device=values.device))
+            return torch.exp(-torch.abs(x) / tau)
+
+        raise ValueError(f"Unsupported spectral window '{self.window_type}'.")
 
     def _spectral_component(
         self,
@@ -74,6 +100,7 @@ class WaveletFilter(nn.Module):
             s_lambda = s_lambda - s0
 
         s_lambda = self.spectral_weights(s_lambda)
+        s_lambda = s_lambda * self._spectral_window(Lambda_scaled).unsqueeze(-1)
 
         x_dense, mask = to_dense_batch(x, batch)
         U_dense, _ = to_dense_batch(U, batch, max_num_nodes=x_dense.size(1))
@@ -109,7 +136,7 @@ class WaveletFilter(nn.Module):
             batch=batch,
         )
         if self.admissible:
-            spatial = spatial - self.cheb.lins[0](x)
+            spatial = spatial - self._spatial_zero_response(x)
 
         spectral = self._spectral_component(x, U, Lambda, batch, scale)
         return spatial + spectral
@@ -127,24 +154,47 @@ class LRGWNLayer(nn.Module):
         admissible: bool,
         aggregation: str,
         dropout: float,
+        residual: bool = True,
+        window_type: str | None = "tukey",
+        feature_mlp_layers: int = 1,
     ) -> None:
         super().__init__()
         self.channels = channels
         self.num_scales = max(int(num_scales), 1)
         self.shared_filters = shared_filters
         self.aggregation = aggregation
+        self.residual = residual
 
-        self.feature_proj = nn.Linear(channels, channels)
+        if feature_mlp_layers <= 0:
+            raise ValueError("feature_mlp_layers must be a positive integer.")
+        if feature_mlp_layers == 1:
+            self.feature_proj = nn.Linear(channels, channels)
+        else:
+            layers: list[nn.Module] = []
+            for _ in range(feature_mlp_layers - 1):
+                layers.append(nn.Linear(channels, channels))
+                layers.append(nn.GELU())
+            layers.append(nn.Linear(channels, channels))
+            self.feature_proj = nn.Sequential(*layers)
         self.dropout = nn.Dropout(dropout)
         self.activation = nn.GELU()
 
         if shared_filters:
-            self.shared_filter = WaveletFilter(
+            self.scale_filter = WaveletFilter(
+                channels,
+                K_cheb,
+                num_gaussians,
+                lambda_cut=lambda_cut,
+                admissible=False,
+                window_type=window_type,
+            )
+            self.shared_wavelet_filter = WaveletFilter(
                 channels,
                 K_cheb,
                 num_gaussians,
                 lambda_cut=lambda_cut,
                 admissible=admissible,
+                window_type=window_type,
             )
             self.log_s_min = nn.Parameter(torch.tensor(0.0))
             self.log_s_delta = nn.Parameter(torch.tensor(0.0))
@@ -154,7 +204,8 @@ class LRGWNLayer(nn.Module):
                 K_cheb,
                 num_gaussians,
                 lambda_cut=lambda_cut,
-                admissible=admissible,
+                admissible=False,
+                window_type=window_type,
             )
             self.wavelet_filters = nn.ModuleList(
                 [
@@ -164,13 +215,14 @@ class LRGWNLayer(nn.Module):
                         num_gaussians,
                         lambda_cut=lambda_cut,
                         admissible=admissible,
+                        window_type=window_type,
                     )
                     for _ in range(self.num_scales)
                 ]
             )
 
-        if aggregation not in {"concat", "sum"}:
-            raise ValueError("aggregation must be 'concat' or 'sum'")
+        if aggregation not in {"concat", "sum", "mean"}:
+            raise ValueError("aggregation must be 'concat', 'sum', or 'mean'")
 
         if aggregation == "concat":
             self.merge = nn.Linear((self.num_scales + 1) * channels, channels)
@@ -201,12 +253,12 @@ class LRGWNLayer(nn.Module):
         outputs = []
 
         if self.shared_filters:
-            scale_out = self.shared_filter(
+            scale_out = self.scale_filter(
                 h, edge_index, U, Lambda, lambda_max, batch, scale=1.0
             )
             outputs.append(self.activation(scale_out))
             for scale in self._scales(x.device):
-                wave_out = self.shared_filter(
+                wave_out = self.shared_wavelet_filter(
                     h, edge_index, U, Lambda, lambda_max, batch, scale=scale
                 )
                 outputs.append(self.activation(wave_out))
@@ -221,7 +273,12 @@ class LRGWNLayer(nn.Module):
 
         if self.aggregation == "sum":
             merged = torch.stack(outputs, dim=0).sum(dim=0)
+        elif self.aggregation == "mean":
+            merged = torch.stack(outputs, dim=0).mean(dim=0)
         else:
             merged = self.merge(torch.cat(outputs, dim=-1))
 
-        return self.dropout(merged)
+        merged = self.dropout(merged)
+        if self.residual:
+            merged = x + merged
+        return merged

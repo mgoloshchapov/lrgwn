@@ -49,7 +49,7 @@ def _build_datasets(cfg: ExperimentConfig, pre_transform, transform):
 
     if cfg.dataset.split_arg:
         datasets = {}
-        for split_idx, split_name in enumerate(("train", "val", "test")):
+        for split_name in ("train", "val", "test"):
             if split_name not in cfg.dataset.splits:
                 raise ValueError(f"dataset.splits missing '{split_name}'.")
             kwargs = dict(init_args)
@@ -58,8 +58,7 @@ def _build_datasets(cfg: ExperimentConfig, pre_transform, transform):
                 kwargs["pre_transform"] = pre_transform
             if transform is not None:
                 kwargs["transform"] = transform
-            # Reload once to refresh processed artifacts, then reuse for other splits.
-            if force_reload and split_idx == 0:
+            if force_reload:
                 kwargs["force_reload"] = True
             datasets[split_name] = dataset_cls(**kwargs)
         return datasets["train"], datasets["val"], datasets["test"]
@@ -78,20 +77,38 @@ def _build_datasets(cfg: ExperimentConfig, pre_transform, transform):
     return train_ds, val_ds, test_ds
 
 
-def _required_encoding_attrs(cfg: ExperimentConfig) -> list[str]:
-    attrs: list[str] = []
+def _required_encoding_attrs(cfg: ExperimentConfig) -> dict[str, int]:
+    attrs: dict[str, int] = {}
+    if cfg.dataset.k_eig > 0:
+        attrs["U"] = int(cfg.dataset.k_eig)
+        attrs["Lambda"] = int(cfg.dataset.k_eig)
+        attrs["Lambda_mask"] = int(cfg.dataset.k_eig)
     if cfg.model.positional_encoding.enabled and cfg.model.positional_encoding.dim > 0:
-        attrs.append(cfg.model.positional_encoding.attr_name)
+        attrs[cfg.model.positional_encoding.attr_name] = int(cfg.model.positional_encoding.dim)
     if cfg.model.structural_encoding.enabled and cfg.model.structural_encoding.dim > 0:
-        attrs.append(cfg.model.structural_encoding.attr_name)
+        attrs[cfg.model.structural_encoding.attr_name] = int(cfg.model.structural_encoding.dim)
     return attrs
 
 
-def _missing_encoding_attrs(dataset, required_attrs: list[str]) -> list[str]:
+def _missing_encoding_attrs(dataset, required_attrs: dict[str, int]) -> list[str]:
     if not required_attrs or len(dataset) == 0:
         return []
     sample = dataset[0]
-    return [attr for attr in required_attrs if not hasattr(sample, attr)]
+    missing_or_mismatched: list[str] = []
+    for attr, expected_dim in required_attrs.items():
+        if not hasattr(sample, attr):
+            missing_or_mismatched.append(f"{attr}:missing")
+            continue
+        values = getattr(sample, attr)
+        if hasattr(values, "size"):
+            actual_dim = int(values.size(-1)) if values.dim() > 0 else 1
+        else:
+            actual_dim = 1
+        if actual_dim != expected_dim:
+            missing_or_mismatched.append(
+                f"{attr}:dim={actual_dim},expected={expected_dim}"
+            )
+    return missing_or_mismatched
 
 
 def _ensure_precomputed_encodings(
@@ -126,14 +143,30 @@ def _ensure_precomputed_encodings(
 
     print(
         "Detected stale processed dataset cache without required encoding attributes "
-        f"{required_attrs}. Rebuilding dataset once with force_reload=True."
+        f"and dimensions {required_attrs}. Rebuilding dataset once with force_reload=True."
     )
     old_force_reload = cfg.dataset.force_reload
     cfg.dataset.force_reload = True
     try:
-        return _build_datasets(cfg, pre_transform, transform)
+        rebuilt_train, rebuilt_val, rebuilt_test = _build_datasets(cfg, pre_transform, transform)
     finally:
         cfg.dataset.force_reload = old_force_reload
+
+    rebuilt_missing = {
+        "train": _missing_encoding_attrs(rebuilt_train, required_attrs),
+        "val": _missing_encoding_attrs(rebuilt_val, required_attrs),
+        "test": _missing_encoding_attrs(rebuilt_test, required_attrs),
+    }
+    if any(missing_attrs for missing_attrs in rebuilt_missing.values()):
+        missing_summary = ", ".join(
+            f"{split}={attrs}" for split, attrs in rebuilt_missing.items() if attrs
+        )
+        raise ValueError(
+            "Required precomputed encoding attributes are still missing after "
+            f"forced dataset rebuild: {missing_summary}."
+        )
+
+    return rebuilt_train, rebuilt_val, rebuilt_test
 
 
 def _infer_in_channels(dataset, sample) -> int:
@@ -336,6 +369,17 @@ def _is_better_metric(metric_name: str, current: float, best: float | None) -> b
     return current < best
 
 
+def _is_better_metric_with_delta(
+    metric_name: str, current: float, best: float | None, min_delta: float
+) -> bool:
+    if best is None:
+        return True
+    delta = max(float(min_delta), 0.0)
+    if _higher_is_better(metric_name):
+        return current > (best + delta)
+    return current < (best - delta)
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -411,24 +455,26 @@ def main(cfg: DictConfig):
         test_dataset,
     )
 
+    loader_kwargs = {
+        "batch_size": cfg_obj.train.batch_size,
+        "num_workers": cfg_obj.train.num_workers,
+        "pin_memory": cfg_obj.train.pin_memory,
+    }
+    if cfg_obj.train.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=cfg_obj.train.batch_size,
         shuffle=True,
-        num_workers=cfg_obj.train.num_workers,
-        pin_memory=cfg_obj.train.pin_memory,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=cfg_obj.train.batch_size,
-        num_workers=cfg_obj.train.num_workers,
-        pin_memory=cfg_obj.train.pin_memory,
+        **loader_kwargs,
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=cfg_obj.train.batch_size,
-        num_workers=cfg_obj.train.num_workers,
-        pin_memory=cfg_obj.train.pin_memory,
+        **loader_kwargs,
     )
 
     sample_graph = train_dataset[0]
@@ -437,6 +483,8 @@ def main(cfg: DictConfig):
 
     model = SpectralGPSModel(
         in_channels=in_channels,
+        node_encoder=cfg_obj.model.node_encoder,
+        atom_feature_dims=cfg_obj.model.atom_feature_dims,
         hidden_channels=cfg_obj.model.hidden_channels,
         out_channels=out_channels,
         num_layers=cfg_obj.model.num_layers,
@@ -448,6 +496,9 @@ def main(cfg: DictConfig):
         admissible=cfg_obj.model.admissible,
         aggregation=cfg_obj.model.aggregation,
         dropout=cfg_obj.model.dropout,
+        residual=cfg_obj.model.residual,
+        spectral_window=cfg_obj.model.spectral_window,
+        feature_mlp_layers=cfg_obj.model.feature_mlp_layers,
         positional_dim=positional_dim,
         structural_dim=structural_dim,
         positional_attr=cfg_obj.model.positional_encoding.attr_name,
@@ -471,6 +522,9 @@ def main(cfg: DictConfig):
     best_checkpoint_path = checkpoint_dir / "best.pt"
     best_val_metric: float | None = None
     best_epoch = 0
+    early_stopping_patience = max(int(cfg_obj.train.early_stopping_patience), 0)
+    early_stopping_min_delta = max(float(cfg_obj.train.early_stopping_min_delta), 0.0)
+    epochs_without_improvement = 0
 
     use_wandb = bool(cfg_obj.logging.use_wandb)
     wandb_kwargs = {
@@ -483,12 +537,19 @@ def main(cfg: DictConfig):
     }
     wandb_kwargs = {k: v for k, v in wandb_kwargs.items() if v is not None}
     wandb.init(**wandb_kwargs)
+    if use_wandb:
+        wandb.define_metric("train/global_step")
+        wandb.define_metric("*", step_metric="train/global_step")
+
+    global_step = 0
+    log_every_steps = max(int(cfg_obj.logging.log_every_steps), 0)
 
     for epoch in range(cfg_obj.train.epochs):
         model.train()
         total_loss = 0.0
+        num_train_batches = max(len(train_loader), 1)
 
-        for data in train_loader:
+        for batch_idx, data in enumerate(train_loader, start=1):
             data = data.to(device)
             optimizer.zero_grad()
             logits = model(data)
@@ -500,6 +561,19 @@ def main(cfg: DictConfig):
                 )
             optimizer.step()
             total_loss += float(loss.item())
+            global_step += 1
+
+            if use_wandb and log_every_steps > 0 and global_step % log_every_steps == 0:
+                wandb.log(
+                    {
+                        "train/global_step": global_step,
+                        "epoch": epoch + 1,
+                        "train/epoch_progress": batch_idx / num_train_batches,
+                        "train/batch_loss": float(loss.item()),
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                    },
+                    step=global_step,
+                )
 
         train_loss = total_loss / max(len(train_loader), 1)
         val_loss, val_metric = _eval_epoch(
@@ -531,6 +605,7 @@ def main(cfg: DictConfig):
             metrics["test/loss"] = test_loss
             metrics[f"test/{cfg_obj.task.metric}"] = test_metric
 
+        best_before_epoch = best_val_metric
         if _is_better_metric(cfg_obj.task.metric, val_metric, best_val_metric):
             best_val_metric = val_metric
             best_epoch = epoch + 1
@@ -545,6 +620,15 @@ def main(cfg: DictConfig):
                 val_metric=val_metric,
                 cfg=cfg,
             )
+        if _is_better_metric_with_delta(
+            cfg_obj.task.metric,
+            val_metric,
+            best_before_epoch,
+            early_stopping_min_delta,
+        ):
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
 
         if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == cfg_obj.train.epochs:
             _save_checkpoint(
@@ -563,12 +647,32 @@ def main(cfg: DictConfig):
             scheduler.step()
 
         if (epoch + 1) % cfg_obj.logging.log_every == 0:
-            wandb.log(metrics)
+            metrics["train/global_step"] = global_step
+            wandb.log(metrics, step=global_step)
 
         print(
             f"Epoch {epoch + 1}, train loss {train_loss:.4f}, "
             f"val loss {val_loss:.4f}, val {cfg_obj.task.metric} {val_metric:.4f}"
         )
+
+        if early_stopping_patience > 0 and epochs_without_improvement >= early_stopping_patience:
+            _save_checkpoint(
+                last_checkpoint_path,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch + 1,
+                best_val_metric=best_val_metric,
+                best_epoch=best_epoch,
+                val_loss=val_loss,
+                val_metric=val_metric,
+                cfg=cfg,
+            )
+            print(
+                "Early stopping triggered at "
+                f"epoch {epoch + 1} (patience={early_stopping_patience}, "
+                f"min_delta={early_stopping_min_delta})."
+            )
+            break
 
     print(f"Saved checkpoints: last='{last_checkpoint_path}', best='{best_checkpoint_path}'")
     wandb.finish()

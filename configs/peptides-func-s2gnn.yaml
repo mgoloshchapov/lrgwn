@@ -17,11 +17,16 @@ dataset:
     val: "val"
     test: "test"
   k_eig: 150
+  eig_dense: true
+  eig_which: "SA"
+  eig_sigma: null
   precompute_transforms: true
   use_lambda_max: true
   force_reload: false
 
 model:
+  node_encoder: "atom"
+  atom_feature_dims: [119, 4, 12, 12, 10, 6, 6, 2, 2]
   hidden_channels: 224
   num_layers: 3
   K_cheb: 2
@@ -32,11 +37,15 @@ model:
   admissible: false
   aggregation: "sum"
   dropout: 0.25
+  residual: true
+  spectral_window: "tukey"
+  feature_mlp_layers: 1
   encoding_fusion: "concat"
   positional_encoding:
     enabled: true
-    kind: "laplacian_eigenvector"
+    kind: "maglap_positional"
     dim: 150
+    sigma: 1.0e-7
     output_dim: 8
     attr_name: "pe"
     is_undirected: true
@@ -70,6 +79,8 @@ train:
   num_workers: 0
   pin_memory: false
   deterministic: false
+  early_stopping_patience: 50
+  early_stopping_min_delta: 0.0
 
 logging:
   use_wandb: true

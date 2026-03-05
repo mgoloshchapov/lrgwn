@@ -8,6 +8,12 @@ splits:
   val: "val"
   test: "test"
 k_eig: 20
+eig_dense: false
+eig_which: "LM"
+eig_sigma: 1.0e-6
+spectral_cache_enabled: true
+spectral_cache_dir: null
+spectral_memory_cache: true
 precompute_transforms: true
 use_lambda_max: true
 force_reload: false

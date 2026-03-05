@@ -1,3 +1,5 @@
+node_encoder: "linear"
+atom_feature_dims: [119, 4, 12, 12, 10, 6, 6, 2, 2]
 hidden_channels: 32
 num_layers: 4
 K_cheb: 8
@@ -8,10 +10,15 @@ shared_filters: false
 admissible: false
 aggregation: "concat"
 dropout: 0.0
+residual: true
+spectral_window: "tukey"
+feature_mlp_layers: 1
+encoding_fusion: "add"
 positional_encoding:
   enabled: true
   kind: "laplacian_eigenvector"
   dim: 16
+  sigma: 1.0e-7
   attr_name: "pe"
   is_undirected: true
 structural_encoding:

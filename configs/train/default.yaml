@@ -14,3 +14,5 @@ checkpoint_interval: 10
 num_workers: 0
 pin_memory: false
 deterministic: false
+early_stopping_patience: 0
+early_stopping_min_delta: 0.0

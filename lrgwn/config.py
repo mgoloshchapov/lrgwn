@@ -17,6 +17,12 @@ class DatasetConfig:
     random_split: list[float] = field(default_factory=lambda: [0.8, 0.1, 0.1])
     split_seed: int = 42
     k_eig: int = 20
+    eig_dense: bool = False
+    eig_which: str = "LM"
+    eig_sigma: float | None = 1e-6
+    spectral_cache_enabled: bool = True
+    spectral_cache_dir: str | None = None
+    spectral_memory_cache: bool = True
     precompute_transforms: bool = True
     use_lambda_max: bool = True
     force_reload: bool = False
@@ -27,6 +33,7 @@ class PositionalEncodingConfig:
     enabled: bool = True
     kind: str = "laplacian_eigenvector"
     dim: int = 16
+    sigma: float = 1e-7
     output_dim: int | None = None
     attr_name: str = "pe"
     is_undirected: bool = True
@@ -44,6 +51,10 @@ class StructuralEncodingConfig:
 
 @dataclass
 class ModelConfig:
+    node_encoder: str = "linear"
+    atom_feature_dims: list[int] = field(
+        default_factory=lambda: [119, 4, 12, 12, 10, 6, 6, 2, 2]
+    )
     hidden_channels: int = 128
     num_layers: int = 4
     K_cheb: int = 3
@@ -54,6 +65,9 @@ class ModelConfig:
     admissible: bool = False
     aggregation: str = "concat"
     dropout: float = 0.0
+    residual: bool = True
+    spectral_window: str | None = "tukey"
+    feature_mlp_layers: int = 1
     encoding_fusion: str = "add"
     positional_encoding: PositionalEncodingConfig = field(
         default_factory=PositionalEncodingConfig
@@ -87,6 +101,8 @@ class TrainConfig:
     num_workers: int = 0
     pin_memory: bool = False
     deterministic: bool = False
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
 
 
 @dataclass
@@ -97,6 +113,7 @@ class LoggingConfig:
     name: str | None = None
     tags: list[str] = field(default_factory=list)
     log_every: int = 1
+    log_every_steps: int = 0
 
 
 @dataclass
