@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 
 import hydra
 import torch
@@ -179,6 +180,68 @@ def _build_criterion(task_type: str):
     raise ValueError(f"Unsupported task.type='{task_type}'.")
 
 
+def _build_optimizer(model: torch.nn.Module, cfg: ExperimentConfig):
+    optimizer_name = cfg.train.optimizer.lower()
+    kwargs = {
+        "lr": cfg.train.lr,
+        "weight_decay": cfg.train.weight_decay,
+    }
+    if optimizer_name == "adam":
+        return torch.optim.Adam(model.parameters(), **kwargs)
+    if optimizer_name == "adamw":
+        return torch.optim.AdamW(model.parameters(), **kwargs)
+    raise ValueError(f"Unsupported train.optimizer='{cfg.train.optimizer}'.")
+
+
+def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: ExperimentConfig):
+    scheduler_name = cfg.train.scheduler.lower()
+    total_epochs = max(int(cfg.train.epochs), 1)
+    warmup_epochs = max(int(cfg.train.num_warmup_epochs), 0)
+
+    if scheduler_name in {"none", ""}:
+        return None
+    if scheduler_name == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_epochs,
+            eta_min=cfg.train.min_lr,
+        )
+    if scheduler_name == "cosine_with_warmup":
+        if warmup_epochs <= 0:
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=total_epochs,
+                eta_min=cfg.train.min_lr,
+            )
+        if warmup_epochs >= total_epochs:
+            warmup_epochs = total_epochs - 1
+        if warmup_epochs <= 0:
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=total_epochs,
+                eta_min=cfg.train.min_lr,
+            )
+
+        start_factor = max(1.0 / warmup_epochs, 1e-8)
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=start_factor,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(total_epochs - warmup_epochs, 1),
+            eta_min=cfg.train.min_lr,
+        )
+        return torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
+        )
+    raise ValueError(f"Unsupported train.scheduler='{cfg.train.scheduler}'.")
+
+
 def _compute_loss_and_targets(task_type: str, criterion, logits, y):
     if task_type == "multilabel_classification":
         targets = y.float()
@@ -259,6 +322,43 @@ def _multilabel_average_precision_macro(logits: torch.Tensor, targets: torch.Ten
     if not scores:
         return 0.0
     return float(sum(scores) / len(scores))
+
+
+def _higher_is_better(metric_name: str) -> bool:
+    return metric_name not in {"mae", "mse", "rmse", "loss"}
+
+
+def _is_better_metric(metric_name: str, current: float, best: float | None) -> bool:
+    if best is None:
+        return True
+    if _higher_is_better(metric_name):
+        return current > best
+    return current < best
+
+
+def _save_checkpoint(
+    path: Path,
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    best_val_metric: float | None,
+    best_epoch: int,
+    val_loss: float,
+    val_metric: float,
+    cfg: DictConfig,
+) -> None:
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_val_metric": best_val_metric,
+        "best_epoch": best_epoch,
+        "val_loss": val_loss,
+        "val_metric": val_metric,
+        "config": OmegaConf.to_container(cfg, resolve=True),
+    }
+    torch.save(checkpoint, path)
 
 
 def _eval_epoch(model, loader, criterion, device, task_type: str, metric_name: str):
@@ -352,10 +452,25 @@ def main(cfg: DictConfig):
         structural_dim=structural_dim,
         positional_attr=cfg_obj.model.positional_encoding.attr_name,
         structural_attr=cfg_obj.model.structural_encoding.attr_name,
+        encoding_fusion=cfg_obj.model.encoding_fusion,
+        positional_out_dim=cfg_obj.model.positional_encoding.output_dim,
+        structural_out_dim=cfg_obj.model.structural_encoding.output_dim,
+        positional_raw_norm_type=cfg_obj.model.positional_encoding.raw_norm_type,
+        structural_raw_norm_type=cfg_obj.model.structural_encoding.raw_norm_type,
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg_obj.train.lr)
+    optimizer = _build_optimizer(model, cfg_obj)
+    scheduler = _build_scheduler(optimizer, cfg_obj)
     criterion = _build_criterion(cfg_obj.task.type)
+    checkpoint_interval = int(cfg_obj.train.checkpoint_interval)
+    if checkpoint_interval <= 0:
+        raise ValueError("train.checkpoint_interval must be a positive integer.")
+    checkpoint_dir = Path("checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    last_checkpoint_path = checkpoint_dir / "last.pt"
+    best_checkpoint_path = checkpoint_dir / "best.pt"
+    best_val_metric: float | None = None
+    best_epoch = 0
 
     use_wandb = bool(cfg_obj.logging.use_wandb)
     wandb_kwargs = {
@@ -379,6 +494,10 @@ def main(cfg: DictConfig):
             logits = model(data)
             loss, _, _ = _compute_loss_and_targets(cfg_obj.task.type, criterion, logits, data.y)
             loss.backward()
+            if cfg_obj.train.clip_grad_norm:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=cfg_obj.train.max_grad_norm
+                )
             optimizer.step()
             total_loss += float(loss.item())
 
@@ -397,6 +516,7 @@ def main(cfg: DictConfig):
             "train/loss": train_loss,
             "val/loss": val_loss,
             f"val/{cfg_obj.task.metric}": val_metric,
+            "train/lr": optimizer.param_groups[0]["lr"],
         }
 
         if cfg_obj.train.test_interval > 0 and (epoch + 1) % cfg_obj.train.test_interval == 0:
@@ -411,6 +531,37 @@ def main(cfg: DictConfig):
             metrics["test/loss"] = test_loss
             metrics[f"test/{cfg_obj.task.metric}"] = test_metric
 
+        if _is_better_metric(cfg_obj.task.metric, val_metric, best_val_metric):
+            best_val_metric = val_metric
+            best_epoch = epoch + 1
+            _save_checkpoint(
+                best_checkpoint_path,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch + 1,
+                best_val_metric=best_val_metric,
+                best_epoch=best_epoch,
+                val_loss=val_loss,
+                val_metric=val_metric,
+                cfg=cfg,
+            )
+
+        if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == cfg_obj.train.epochs:
+            _save_checkpoint(
+                last_checkpoint_path,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch + 1,
+                best_val_metric=best_val_metric,
+                best_epoch=best_epoch,
+                val_loss=val_loss,
+                val_metric=val_metric,
+                cfg=cfg,
+            )
+
+        if scheduler is not None:
+            scheduler.step()
+
         if (epoch + 1) % cfg_obj.logging.log_every == 0:
             wandb.log(metrics)
 
@@ -419,6 +570,7 @@ def main(cfg: DictConfig):
             f"val loss {val_loss:.4f}, val {cfg_obj.task.metric} {val_metric:.4f}"
         )
 
+    print(f"Saved checkpoints: last='{last_checkpoint_path}', best='{best_checkpoint_path}'")
     wandb.finish()
 
 

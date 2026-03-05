@@ -27,8 +27,10 @@ class PositionalEncodingConfig:
     enabled: bool = True
     kind: str = "laplacian_eigenvector"
     dim: int = 16
+    output_dim: int | None = None
     attr_name: str = "pe"
     is_undirected: bool = True
+    raw_norm_type: str | None = None
 
 
 @dataclass
@@ -36,7 +38,9 @@ class StructuralEncodingConfig:
     enabled: bool = True
     kind: str = "random_walk"
     dim: int = 16
+    output_dim: int | None = None
     attr_name: str = "se"
+    raw_norm_type: str | None = None
 
 @dataclass
 class ModelConfig:
@@ -50,6 +54,7 @@ class ModelConfig:
     admissible: bool = False
     aggregation: str = "concat"
     dropout: float = 0.0
+    encoding_fusion: str = "add"
     positional_encoding: PositionalEncodingConfig = field(
         default_factory=PositionalEncodingConfig
     )
@@ -67,10 +72,18 @@ class TaskConfig:
 @dataclass
 class TrainConfig:
     lr: float = 1e-3
+    optimizer: str = "adam"
+    weight_decay: float = 0.0
+    scheduler: str = "none"
+    num_warmup_epochs: int = 0
+    min_lr: float = 0.0
+    clip_grad_norm: bool = False
+    max_grad_norm: float = 1.0
     epochs: int = 100
     batch_size: int = 32
     device: str = "cpu"
     test_interval: int = 10
+    checkpoint_interval: int = 10
     num_workers: int = 0
     pin_memory: bool = False
     deterministic: bool = False

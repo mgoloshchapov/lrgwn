@@ -1,8 +1,16 @@
 lr: 0.001
+optimizer: "adam"
+weight_decay: 0.0
+scheduler: "none"
+num_warmup_epochs: 0
+min_lr: 0.0
+clip_grad_norm: false
+max_grad_norm: 1.0
 epochs: 100
 batch_size: 32
 device: "cpu"
 test_interval: 10
+checkpoint_interval: 10
 num_workers: 0
 pin_memory: false
 deterministic: false

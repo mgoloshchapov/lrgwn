@@ -1,0 +1,80 @@
+defaults:
+  - dataset: peptides-func
+  - model: lrgwn-gps
+  - train: default
+  - logging: default
+  - task: multilabel
+  - _self_
+
+dataset:
+  target: "torch_geometric.datasets.LRGBDataset"
+  init_args:
+    root: "./data"
+    name: "Peptides-func"
+  split_arg: "split"
+  splits:
+    train: "train"
+    val: "val"
+    test: "test"
+  k_eig: 150
+  precompute_transforms: true
+  use_lambda_max: true
+  force_reload: false
+
+model:
+  hidden_channels: 224
+  num_layers: 3
+  K_cheb: 2
+  num_scales: 1
+  num_gaussians: 60
+  lambda_cut: 0.7
+  shared_filters: false
+  admissible: false
+  aggregation: "sum"
+  dropout: 0.25
+  encoding_fusion: "concat"
+  positional_encoding:
+    enabled: true
+    kind: "laplacian_eigenvector"
+    dim: 150
+    output_dim: 8
+    attr_name: "pe"
+    is_undirected: true
+    raw_norm_type: null
+  structural_encoding:
+    enabled: true
+    kind: "random_walk"
+    dim: 20
+    output_dim: 28
+    attr_name: "se"
+    raw_norm_type: "BatchNorm"
+
+task:
+  type: "multilabel_classification"
+  metric: "average_precision"
+
+train:
+  lr: 0.00225
+  optimizer: "adamw"
+  weight_decay: 0.0035
+  scheduler: "cosine_with_warmup"
+  num_warmup_epochs: 5
+  min_lr: 0.0
+  clip_grad_norm: true
+  max_grad_norm: 1.0
+  epochs: 250
+  batch_size: 200
+  device: "cuda"
+  test_interval: 1
+  checkpoint_interval: 100
+  num_workers: 0
+  pin_memory: false
+  deterministic: false
+
+logging:
+  use_wandb: true
+  project: "peptides-func"
+  entity: "tum_i26"
+  name: null
+  tags: ["s2gnn-mapped"]
+  log_every: 1
